@@ -109,11 +109,11 @@ def load4train(samples_path_list, args):
 #The input is the full set of data from the first session.
 def getDataLoaders(one_subject, args):
     pre_path=args.path
-    config_path = {"file_path": pre_path + args.session + "/",
-                   "label_path": pre_path+"label.mat"}
+    config_path = {"file_path": os.path.join(pre_path, args.session),
+                   "label_path": os.path.join(pre_path, "label.mat")}
     path_list = get_data_path(config_path["file_path"])
     try:
-        target_path_list = [i for i in path_list if(i.startswith(config_path["file_path"] + str(int(one_subject+1))+"_"))]
+        target_path_list = [i for i in path_list if(i.startswith(os.path.join(config_path["file_path"], str(int(one_subject+1))+"_")))]
         target_path=target_path_list[0]
     except:
         print("target data not exist")

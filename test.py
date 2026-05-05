@@ -16,6 +16,8 @@ def testDMMR(dataLoader, DMMRTestModel, cuda, batch_size):
             test_input, label = Variable(test_input), Variable(label)
             data_set_all += len(label)
             x_shared_pred = DMMRTestModel(test_input)
+            if isinstance(x_shared_pred, tuple):
+                x_shared_pred = x_shared_pred[0]
             _, pred = torch.max(x_shared_pred, dim=1)
             count += pred.eq(label.squeeze().data.view_as(pred)).sum()
             index += batch_size
