@@ -80,6 +80,10 @@ if __name__ == '__main__':
     parser.add_argument("--num_workers_train", type=int, default=None, help="override training dataloader workers")
     parser.add_argument("--num_workers_test", type=int, default=None, help="override test dataloader workers")
     parser.add_argument("--max_train_batches", type=int, default=None, help="limit optimization steps per epoch for quick runs")
+    parser.add_argument("--resume", action="store_true", help="resume training from subject checkpoint if available")
+    parser.add_argument("--resume_dir", type=str, default="checkpoints", help="directory used to store subject checkpoints")
+    parser.add_argument("--ckpt_every_pretrain", type=int, default=1, help="save pretraining checkpoint every N epochs")
+    parser.add_argument("--ckpt_every_finetune", type=int, default=1, help="save finetuning checkpoint every N epochs")
 
     #config of DMMR
     parser.add_argument("--input_dim", type=int, default=310, help="input dim is the same with sample's last dim")

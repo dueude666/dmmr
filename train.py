@@ -292,6 +292,29 @@ def _build_model_with_state(model, state):
     ema_model.load_state_dict(ema_state_dict)
     return ema_model
 
+
+def _checkpoint_path(args, one_subject):
+    ckpt_dir = os.path.join(getattr(args, "resume_dir", "checkpoints"), args.way, args.index)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    return os.path.join(ckpt_dir, "subject_{:02d}.pt".format(int(one_subject)))
+
+
+def _save_subject_checkpoint(args, one_subject, payload):
+    path = _checkpoint_path(args, one_subject)
+    tmp_path = path + ".tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+    return path
+
+
+def _load_subject_checkpoint(args, one_subject, cuda):
+    path = _checkpoint_path(args, one_subject)
+    if not os.path.exists(path):
+        return None, path
+    map_location = "cuda" if cuda else "cpu"
+    ckpt = torch.load(path, map_location=map_location)
+    return ckpt, path
+
 def trainDMMR(data_loader_dict, optimizer_config, cuda, args, iteration, writer, one_subject):
     # data of source subjects, which is used as the training set
     source_loader = data_loader_dict['source_loader']
@@ -592,11 +615,36 @@ def trainDMMR(data_loader_dict, optimizer_config, cuda, args, iteration, writer,
         pretrain_params += list(contrastive_criterion.parameters())
     optimizer_PreTraining = torch.optim.Adam(pretrain_params, **optimizer_config)
 
+    resume_enabled = bool(getattr(args, "resume", False))
+    resume_ckpt = None
+    resume_ckpt_path = None
+    pretrain_start_epoch = 0
+    if resume_enabled:
+        resume_ckpt, resume_ckpt_path = _load_subject_checkpoint(args, one_subject, cuda)
+        if resume_ckpt is not None:
+            if "pretrain_model_state" in resume_ckpt:
+                preTrainModel.load_state_dict(resume_ckpt["pretrain_model_state"])
+            if "optimizer_pretrain_state" in resume_ckpt:
+                optimizer_PreTraining.load_state_dict(resume_ckpt["optimizer_pretrain_state"])
+            if contrastive_criterion is not None and resume_ckpt.get("contrastive_state") is not None:
+                contrastive_criterion.load_state_dict(resume_ckpt["contrastive_state"])
+            if resume_ckpt.get("phase") == "pretrain":
+                pretrain_start_epoch = int(resume_ckpt.get("pretrain_epoch", -1)) + 1
+            elif resume_ckpt.get("phase") == "finetune":
+                pretrain_start_epoch = int(args.epoch_preTraining)
+            pretrain_start_epoch = max(0, min(pretrain_start_epoch, int(args.epoch_preTraining)))
+            print("resume_checkpoint_loaded:", resume_ckpt_path)
+            print("resume_phase:", resume_ckpt.get("phase", "unknown"))
+            print("resume_pretrain_start_epoch:", pretrain_start_epoch)
+
     acc_final = 0
     best_epoch = -1
     last_test_acc = 0.0
+    best_pretrain_model = copy.deepcopy(preTrainModel.state_dict())
+    best_tune_model = None
+    best_test_model = None
     max_train_batches = getattr(args, "max_train_batches", None)
-    for epoch in range(args.epoch_preTraining):
+    for epoch in range(pretrain_start_epoch, args.epoch_preTraining):
         print("epoch: "+str(epoch))
         start_time_pretrain = time.time()
         preTrainModel.train()
@@ -732,6 +780,21 @@ def trainDMMR(data_loader_dict, optimizer_config, cuda, args, iteration, writer,
         pretrain_epoch_time = end_time_pretrain - start_time_pretrain
         print("The time required for one pre-training epoch is：", pretrain_epoch_time, "second")
         print("rec_loss: "+str(rec_loss))
+        if resume_enabled:
+            ckpt_every_pre = int(getattr(args, "ckpt_every_pretrain", 1))
+            if ckpt_every_pre > 0 and ((epoch + 1) % ckpt_every_pre == 0):
+                ckpt_payload = {
+                    "phase": "pretrain",
+                    "subject": int(one_subject),
+                    "pretrain_epoch": int(epoch),
+                    "pretrain_model_state": preTrainModel.state_dict(),
+                    "optimizer_pretrain_state": optimizer_PreTraining.state_dict(),
+                    "contrastive_state": contrastive_criterion.state_dict() if contrastive_criterion is not None else None,
+                    "args_way": args.way,
+                    "args_index": args.index,
+                }
+                ckpt_path = _save_subject_checkpoint(args, one_subject, ckpt_payload)
+                print("checkpoint_saved:", ckpt_path)
 
     # The fine-tuning phase
     source_iters2 = []
@@ -843,7 +906,36 @@ def trainDMMR(data_loader_dict, optimizer_config, cuda, args, iteration, writer,
         print("finetune_ema_param_count:", sum(v.numel() for v in finetune_ema_state.values()))
         writer.add_text("subject {} finetune ema enabled".format(one_subject + 1), "True")
         writer.add_text("subject {} finetune ema decay".format(one_subject + 1), str(finetune_ema_decay))
-    for epoch in range(args.epoch_fineTuning):
+    finetune_start_epoch = 0
+    if resume_enabled and resume_ckpt is not None and resume_ckpt.get("phase") == "finetune":
+        if "pretrain_model_state" in resume_ckpt:
+            preTrainModel.load_state_dict(resume_ckpt["pretrain_model_state"])
+        if "finetune_model_state" in resume_ckpt:
+            fineTuneModel.load_state_dict(resume_ckpt["finetune_model_state"])
+        if "optimizer_finetune_state" in resume_ckpt:
+            optimizer_FineTuning.load_state_dict(resume_ckpt["optimizer_finetune_state"])
+        if rcc_loss_fn is not None and resume_ckpt.get("rcc_state") is not None:
+            rcc_loss_fn.load_state_dict(resume_ckpt["rcc_state"])
+        if resume_ckpt.get("finetune_ema_state") is not None:
+            finetune_ema_state = resume_ckpt.get("finetune_ema_state")
+        if resume_ckpt.get("source_loss_ema") is not None:
+            source_loss_ema = list(resume_ckpt.get("source_loss_ema"))
+        acc_final = float(resume_ckpt.get("acc_final", acc_final))
+        best_epoch = int(resume_ckpt.get("best_epoch", best_epoch))
+        last_test_acc = float(resume_ckpt.get("last_test_acc", last_test_acc))
+        if resume_ckpt.get("best_pretrain_model") is not None:
+            best_pretrain_model = resume_ckpt.get("best_pretrain_model")
+        if resume_ckpt.get("best_tune_model") is not None:
+            best_tune_model = resume_ckpt.get("best_tune_model")
+        if resume_ckpt.get("best_test_model") is not None:
+            best_test_model = resume_ckpt.get("best_test_model")
+        finetune_start_epoch = int(resume_ckpt.get("finetune_epoch", -1)) + 1
+        finetune_start_epoch = max(0, min(finetune_start_epoch, int(args.epoch_fineTuning)))
+        print("resume_finetune_start_epoch:", finetune_start_epoch)
+        print("resume_best_acc:", acc_final)
+        print("resume_best_epoch:", best_epoch)
+
+    for epoch in range(finetune_start_epoch, args.epoch_fineTuning):
         if bool(getattr(args, "freeze_encoder_first_epoch", 0)):
             freeze_encoder_now = (epoch == 0)
             for p in fineTuneModel.sharedEncoder.parameters():
@@ -1250,6 +1342,37 @@ def trainDMMR(data_loader_dict, optimizer_config, cuda, args, iteration, writer,
             best_pretrain_model = copy.deepcopy(preTrainModel.state_dict())
             best_tune_model = copy.deepcopy(fineTuneModel.state_dict())
             best_test_model = copy.deepcopy(testModel.state_dict())
+        if resume_enabled:
+            ckpt_every_ft = int(getattr(args, "ckpt_every_finetune", 1))
+            if ckpt_every_ft > 0 and ((epoch + 1) % ckpt_every_ft == 0):
+                ckpt_payload = {
+                    "phase": "finetune",
+                    "subject": int(one_subject),
+                    "pretrain_epoch": int(args.epoch_preTraining - 1),
+                    "finetune_epoch": int(epoch),
+                    "pretrain_model_state": preTrainModel.state_dict(),
+                    "finetune_model_state": fineTuneModel.state_dict(),
+                    "optimizer_pretrain_state": optimizer_PreTraining.state_dict(),
+                    "optimizer_finetune_state": optimizer_FineTuning.state_dict(),
+                    "contrastive_state": contrastive_criterion.state_dict() if contrastive_criterion is not None else None,
+                    "rcc_state": rcc_loss_fn.state_dict() if rcc_loss_fn is not None else None,
+                    "finetune_ema_state": finetune_ema_state,
+                    "source_loss_ema": source_loss_ema,
+                    "acc_final": float(acc_final),
+                    "best_epoch": int(best_epoch),
+                    "last_test_acc": float(last_test_acc),
+                    "best_pretrain_model": best_pretrain_model if 'best_pretrain_model' in locals() else None,
+                    "best_tune_model": best_tune_model if 'best_tune_model' in locals() else None,
+                    "best_test_model": best_test_model if 'best_test_model' in locals() else None,
+                    "args_way": args.way,
+                    "args_index": args.index,
+                }
+                ckpt_path = _save_subject_checkpoint(args, one_subject, ckpt_payload)
+                print("checkpoint_saved:", ckpt_path)
+    if best_tune_model is None:
+        best_tune_model = copy.deepcopy(fineTuneModel.state_dict())
+    if best_test_model is None:
+        best_test_model = copy.deepcopy(DMMRTestModel(fineTuneModel).state_dict())
     modelDir = "model/" + args.way + "/" + args.index + "/"
     try:
         os.makedirs(modelDir)
