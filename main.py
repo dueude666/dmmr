@@ -46,6 +46,27 @@ def set_seed(seed=3):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
+
+def _resolve_seed_data_root(dataset_name, requested_root):
+    requested_root = os.path.abspath(requested_root)
+    session_probe = os.path.join(requested_root, "1")
+    if os.path.isdir(session_probe):
+        return requested_root
+    if dataset_name != "seed3":
+        return requested_root
+    candidates = [
+        "/home/tgh/tgh/ExtractedFeatures",
+        "/home/tgh/ExtractedFeatures",
+        "/home/tgh/tgh/data/ExtractedFeatures",
+        "/home/tgh/data/ExtractedFeatures",
+    ]
+    for cand in candidates:
+        if os.path.isdir(os.path.join(cand, "1")):
+            print("seed3_path_auto_resolved:", cand)
+            return cand
+    print("seed3_path_not_found_using_requested:", requested_root)
+    return requested_root
+
 def main(data_loader_dict, args, optim_config, cuda, writer, one_subject, seed=3):
     set_seed(seed)
     if args.dataset_name == 'seed3':
@@ -294,7 +315,7 @@ if __name__ == '__main__':
     if args.num_workers_test is None:
         args.num_workers_test = 2 if cuda else 0
     if args.dataset_name == "seed3":
-        args.path = args.seed3_path
+        args.path = _resolve_seed_data_root(args.dataset_name, args.seed3_path)
         args.cls_classes = 3
         if args.time_steps is None:
             args.time_steps = 30
@@ -303,7 +324,7 @@ if __name__ == '__main__':
         if args.epoch_preTraining is None:
             args.epoch_preTraining = 300  #epoch of the pre-training phase
     elif args.dataset_name == "seed4":
-        args.path = args.seed4_path
+        args.path = os.path.abspath(args.seed4_path)
         args.cls_classes = 4
         if args.time_steps is None:
             args.time_steps = 10
