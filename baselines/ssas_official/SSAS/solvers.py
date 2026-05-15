@@ -10,10 +10,15 @@ from sklearn.metrics import f1_score
 from sklearn.preprocessing import label_binarize
 import Adver_network
 from new_network import MLPBase, feat_bottleneck, feat_classifier
+import copy
 try:
     from feature_mixstyle import FeatureMixStyle
 except ImportError:
     FeatureMixStyle = None
+try:
+    from rspm_loss import ReliabilitySourcePrototypeMemory
+except ImportError:
+    ReliabilitySourcePrototypeMemory = None
 
 
 def test_suda(loader, model):
@@ -211,6 +216,43 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
     if getattr(args, "use_feature_mixstyle", False) and FeatureMixStyle is not None:
         mixstyle = FeatureMixStyle(p=getattr(args, "mixstyle_p", 0.5), alpha=getattr(args, "mixstyle_alpha", 0.1)).to(args.device)
         print(f"[SSAS] FeatureMixStyle enabled in DGMA stage: p={mixstyle.p}, alpha={mixstyle.alpha}")
+    rspm = None
+    rspm_stats = None
+    if getattr(args, "use_rspm", False) and ReliabilitySourcePrototypeMemory is not None:
+        rspm = ReliabilitySourcePrototypeMemory(
+            num_domains=num_domains - 1,
+            num_classes=args.num_class,
+            feature_dim=args.bottleneck_dim,
+            temperature=getattr(args, "rspm_temperature", 0.2),
+            momentum=getattr(args, "rspm_momentum", 0.9),
+            target_conf_threshold=getattr(args, "rspm_target_conf_threshold", 0.7),
+            reliability_tau=getattr(args, "rspm_reliability_tau", 1.0),
+            target_weight=getattr(args, "rspm_target_weight", 0.3),
+        ).to(args.device)
+        print(
+            "[SSAS] RSPM enabled: "
+            f"weight={getattr(args, 'rspm_weight', 0.05)}, "
+            f"temperature={rspm.temperature}, momentum={rspm.momentum}, "
+            f"target_conf_threshold={rspm.target_conf_threshold}, target_weight={rspm.target_weight}"
+        )
+    ema_modules = None
+    ema_consistency_loss = None
+    ema_mask = None
+    if getattr(args, "use_ema_teacher", False):
+        ema_modules = {
+            "netA": copy.deepcopy(netA).to(args.device).eval(),
+            "netB": copy.deepcopy(netB).to(args.device).eval(),
+            "netC": copy.deepcopy(netC).to(args.device).eval(),
+        }
+        for module in ema_modules.values():
+            for param in module.parameters():
+                param.requires_grad_(False)
+        print(
+            "[SSAS] EMA teacher enabled: "
+            f"decay={getattr(args, 'ema_decay', 0.99)}, "
+            f"weight={getattr(args, 'ema_consistency_weight', 0.05)}, "
+            f"conf_threshold={getattr(args, 'ema_conf_threshold', 0.6)}"
+        )
     for i in range(args.max_iter2):
 
         for batch_idx, data in enumerate(datasets):
@@ -252,6 +294,24 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
 
             features_target = netB(netA(x_trg))
             outputs_target = netC(features_target)
+            if ema_modules is not None:
+                with torch.no_grad():
+                    ema_features_target = ema_modules["netB"](ema_modules["netA"](x_trg))
+                    ema_outputs_target = ema_modules["netC"](ema_features_target)
+                    ema_probs = torch.nn.functional.softmax(ema_outputs_target, dim=1)
+                    ema_conf, _ = ema_probs.max(dim=1)
+                    ema_mask = ema_conf >= getattr(args, "ema_conf_threshold", 0.6)
+                if ema_mask.any():
+                    ema_consistency_loss = torch.nn.functional.kl_div(
+                        torch.nn.functional.log_softmax(outputs_target[ema_mask], dim=1),
+                        ema_probs[ema_mask],
+                        reduction="batchmean",
+                    )
+                else:
+                    ema_consistency_loss = outputs_target.new_tensor(0.0)
+            else:
+                ema_consistency_loss = None
+                ema_mask = None
             # 目标域预测标签
             pseu_labels_target = torch.argmax(outputs_target, dim=1)
 
@@ -260,6 +320,8 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
             pred_src_domain_F = []
             pred_src_class = []
             pred_src = []
+            rspm_source_features = []
+            rspm_source_labels = []
             coral_loss = 0
             mmd_b_loss = 0 
             mmd_t_loss = 0
@@ -276,6 +338,8 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
                 pred_src_domain_D.append(outputs_source_domain_D)
                 pred_src_domain_F.append(outputs_source_domain_F)
                 pred_src_class.append(output_source_class)
+                rspm_source_features.append(features_source)
+                rspm_source_labels.append(y_src[domain_idx])
                 # coral_loss = utils.CORAL_loss(features_source, features_target)
                 mmd_b_loss += utils.marginal(features_source,features_target)
                 mmd_t_loss += utils.conditional(
@@ -304,6 +368,21 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
             MMD_loss = 0.5*mmd_b_loss + 0.5*mmd_t_loss
             # MMD_loss = loss_lmmd_2
             total_loss = classifier_loss + Adver_domain_labels_loss + MMD_loss + same_domain_loss #一个交叉熵加上CMD、SM的领域自适应损失，再加上一个目标域的损失
+            if rspm is not None:
+                rspm_loss, rspm_stats = rspm(
+                    source_features=rspm_source_features,
+                    source_labels=rspm_source_labels,
+                    target_features=features_target,
+                    target_logits=outputs_target,
+                )
+                total_loss = total_loss + getattr(args, "rspm_weight", 0.05) * rspm_loss
+            if ema_consistency_loss is not None:
+                total_loss = total_loss + getattr(args, "ema_consistency_weight", 0.05) * ema_consistency_loss
+            if getattr(args, "use_target_entropy", False):
+                target_entropy_loss = utils.Entropylogits(outputs_target)
+                total_loss = total_loss + getattr(args, "target_entropy_weight", 0.01) * target_entropy_loss
+            else:
+                target_entropy_loss = None
 
             # 重置梯度
             # optimizer.zero_grad()
@@ -326,6 +405,10 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
             optimizer_B.step()
             optimizer_C.step()
             optimizer_D.step()
+            if ema_modules is not None:
+                _update_ema_module(ema_modules["netA"], netA, getattr(args, "ema_decay", 0.99))
+                _update_ema_module(ema_modules["netB"], netB, getattr(args, "ema_decay", 0.99))
+                _update_ema_module(ema_modules["netC"], netC, getattr(args, "ema_decay", 0.99))
         # 模型转变test
         netA.train(False)
         netB.train(False)
@@ -337,6 +420,24 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
         # 计算准确率及其他指标
         acc, best_f1, best_auc, best_mat, features, labels = test_muda(dataset_test, netA,netB,netC,args)
         log_str = "iter: {:05d}, \t accuracy: {:.4f} \t f1: {:.4f} \t auc: {:.4f}".format(i, acc, best_f1, best_auc)
+        if rspm_stats is not None:
+            log_str += (
+                " \t rspm_loss: {:.4f} \t rspm_src: {} \t rspm_tgt: {} "
+                "\t rel_mean: {:.4f} \t center_norm: {:.4f}"
+            ).format(
+                rspm_stats["rspm_loss"],
+                rspm_stats["rspm_valid_source_samples"],
+                rspm_stats["rspm_valid_target_samples"],
+                rspm_stats["rspm_reliability_mean"],
+                rspm_stats["rspm_center_norm"],
+            )
+        if ema_consistency_loss is not None:
+            log_str += " \t ema_loss: {:.4f} \t ema_valid: {}".format(
+                float(ema_consistency_loss.detach().item()),
+                int(ema_mask.sum().item()) if ema_mask is not None else 0,
+            )
+        if target_entropy_loss is not None:
+            log_str += " \t target_entropy: {:.4f}".format(float(target_entropy_loss.detach().item()))
         if final_acc < acc:
             final_acc = acc
             final_f1 = best_f1
@@ -348,3 +449,11 @@ def NEW_DGMA(X, Y, Domain_label, count_num, netF, args):
         log_total_loss.append(total_loss.data)
 
     return X, Y, final_acc, final_f1, final_auc, final_mat,  log_total_loss, acc
+
+
+@torch.no_grad()
+def _update_ema_module(teacher, student, decay):
+    for teacher_param, student_param in zip(teacher.parameters(), student.parameters()):
+        teacher_param.data.mul_(decay).add_(student_param.data, alpha=1.0 - decay)
+    for teacher_buffer, student_buffer in zip(teacher.buffers(), student.buffers()):
+        teacher_buffer.data.copy_(student_buffer.data)

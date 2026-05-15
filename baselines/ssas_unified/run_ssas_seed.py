@@ -131,6 +131,19 @@ def build_official_args(cli_args, fold_output_dir: Path, fold_log_file):
         use_feature_mixstyle=cli_args.use_feature_mixstyle,
         mixstyle_p=cli_args.mixstyle_p,
         mixstyle_alpha=cli_args.mixstyle_alpha,
+        use_rspm=cli_args.use_rspm,
+        rspm_weight=cli_args.rspm_weight,
+        rspm_temperature=cli_args.rspm_temperature,
+        rspm_momentum=cli_args.rspm_momentum,
+        rspm_target_conf_threshold=cli_args.rspm_target_conf_threshold,
+        rspm_target_weight=cli_args.rspm_target_weight,
+        rspm_reliability_tau=cli_args.rspm_reliability_tau,
+        use_ema_teacher=cli_args.use_ema_teacher,
+        ema_decay=cli_args.ema_decay,
+        ema_consistency_weight=cli_args.ema_consistency_weight,
+        ema_conf_threshold=cli_args.ema_conf_threshold,
+        use_target_entropy=cli_args.use_target_entropy,
+        target_entropy_weight=cli_args.target_entropy_weight,
         file_path=str(cli_args.flat_session_dir) + os.sep,
         log_file=fold_log_file,
         ila_switch_iter=1,
@@ -230,6 +243,19 @@ def parse_args():
     parser.add_argument("--use_feature_mixstyle", action="store_true")
     parser.add_argument("--mixstyle_p", type=float, default=0.5)
     parser.add_argument("--mixstyle_alpha", type=float, default=0.1)
+    parser.add_argument("--use_rspm", action="store_true")
+    parser.add_argument("--rspm_weight", type=float, default=0.05)
+    parser.add_argument("--rspm_temperature", type=float, default=0.2)
+    parser.add_argument("--rspm_momentum", type=float, default=0.9)
+    parser.add_argument("--rspm_target_conf_threshold", type=float, default=0.7)
+    parser.add_argument("--rspm_target_weight", type=float, default=0.3)
+    parser.add_argument("--rspm_reliability_tau", type=float, default=1.0)
+    parser.add_argument("--use_ema_teacher", action="store_true")
+    parser.add_argument("--ema_decay", type=float, default=0.99)
+    parser.add_argument("--ema_consistency_weight", type=float, default=0.05)
+    parser.add_argument("--ema_conf_threshold", type=float, default=0.6)
+    parser.add_argument("--use_target_entropy", action="store_true")
+    parser.add_argument("--target_entropy_weight", type=float, default=0.01)
     return parser.parse_args()
 
 
